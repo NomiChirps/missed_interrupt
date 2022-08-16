@@ -17,3 +17,18 @@ In the long term the difference between the RX DMA interrupt count and the TX DM
 The timing is apparently pretty finicky; with this trimmed-down example code, I've only been able to reproduce the issue at SPI frequency 1MHz and transfer size of 1 byte. The way the interrupt handler checks for which channel's IRQ to acknowledge also seems to be important; if it checks both before acknowledging either, the imbalance grows much more slowly than if it does check0-ack0-check1-ack1. I don't know if that actually has something to do with the problem, or if it's just because this slightly changes the timing.
 
 I'm pretty stumped at this point. Am I doing something subtly wrong in that code? I've configured everything correctly as far as I can tell. This kind of usage should be reliable, right?
+
+## caught on the scope
+
+![scope trace](/DS1Z_QuickPrint1.png)
+
+From top to bottom:
+- Channel 4 (blue) toggles in the main loop just before starting each transfer.
+- Channel 3 (cyan) toggles in the interrupt handler each time the TX channel finishes.
+- Channel 2 (pink) toggles in the interrupt handler each time the RX channel finishes.
+- Channel 1 is the SPI SCLK signal.
+
+Each transfer-start is followed by TX finishing after about 1us, then by RX finishing after about 10us.
+
+The low-to-high transition of channel 4  just before the big gap in the middle is the problematic transfer being started.
+Evidently the TX interrupt takes longer to trigger at that moment. The RX interrupt does not get triggered at all before the main loop polling sees that both channels are idle and starts the next transfer.
