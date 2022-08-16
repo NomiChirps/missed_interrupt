@@ -11,37 +11,34 @@
 int tx_channel;
 int rx_channel;
 
-// At 100'000, imbalance is stable at zero.
-// At 1'000'000, it slowly grows.
-// At 2'000'000, grows more slowly...
-// At 8'000'000, stable.
-// At 16'000'000, stable.
-const int spi_frequency = 1'000'000;
+const int spi_frequency = 8'000'000;
 
 const int irq_index = 1;
 
-volatile uint32_t tx_interrupt_count = 0;
-volatile uint32_t rx_interrupt_count = 0;
-volatile int32_t tx_vs_rx_count = 0;
+volatile bool got_tx = 0;
+volatile bool got_rx = 0;
 
 const int debug_gpio_irq = 5;
 const int debug_gpio_tx = 6;
 const int debug_gpio_rx = 7;
+const int debug_gpio_start = 8;
 
+// Straightforward: checks one channel, acks it, then the other.
 void DMA_ISR() {
   gpio_put(debug_gpio_irq, 1);
   if (dma_irqn_get_channel_status(irq_index, tx_channel)) {
     gpio_put(debug_gpio_tx, !gpio_get(debug_gpio_tx));
     dma_irqn_acknowledge_channel(irq_index, tx_channel);
-    tx_interrupt_count++;
-    tx_vs_rx_count++;
+    got_tx = 1;
   }
   if (dma_irqn_get_channel_status(irq_index, rx_channel)) {
     gpio_put(debug_gpio_rx, !gpio_get(debug_gpio_rx));
     dma_irqn_acknowledge_channel(irq_index, rx_channel);
-    rx_interrupt_count++;
-    tx_vs_rx_count--;
+    got_rx = 1;
   }
+  // putting barriers doesn't help
+  __asm("dmb");
+  __asm("isb");
   gpio_put(debug_gpio_irq, 0);
 }
 
@@ -52,9 +49,11 @@ int main() {
   gpio_init(debug_gpio_irq);
   gpio_init(debug_gpio_tx);
   gpio_init(debug_gpio_rx);
+  gpio_init(debug_gpio_start);
   gpio_set_dir(debug_gpio_irq, GPIO_OUT);
   gpio_set_dir(debug_gpio_tx, GPIO_OUT);
   gpio_set_dir(debug_gpio_rx, GPIO_OUT);
+  gpio_set_dir(debug_gpio_start, GPIO_OUT);
 
   spi_init(spi1, spi_frequency);
   spi_set_format(spi1, 8, SPI_CPOL_0, SPI_CPHA_0, SPI_MSB_FIRST);
@@ -65,7 +64,9 @@ int main() {
   // mosi = 11
   // miso = 12
 
-  const int transfer_count = 1;
+  // spi_frequency / 1'000'000 seems to trigger it reliably
+  const int transfer_count = 4;
+
   uint8_t dummy1[transfer_count];
   uint8_t dummy2[transfer_count];
   volatile void* tx_read = &dummy1;
@@ -90,7 +91,7 @@ int main() {
   channel_config_set_transfer_data_size(&c, DMA_SIZE_8);
 
   // TX
-  channel_config_set_read_increment(&c, false);
+  channel_config_set_read_increment(&c, true);
   channel_config_set_write_increment(&c, false);
   channel_config_set_dreq(&c, spi_get_dreq(spi1, true));
   channel_config_set_chain_to(&c, tx_channel);  // self-chain disables it
@@ -101,7 +102,7 @@ int main() {
 
   // RX
   channel_config_set_read_increment(&c, false);
-  channel_config_set_write_increment(&c, false);
+  channel_config_set_write_increment(&c, true);
   channel_config_set_dreq(&c, spi_get_dreq(spi1, false));
   channel_config_set_chain_to(&c, rx_channel);  // self-chain disables it
   dma_channel_set_config(rx_channel, &c, false);
@@ -113,29 +114,41 @@ int main() {
 
   dma_irqn_set_channel_enabled(irq_index, tx_channel, true);
   dma_irqn_set_channel_enabled(irq_index, rx_channel, true);
+
   irq_set_exclusive_handler(irq_index ? DMA_IRQ_1 : DMA_IRQ_0, &DMA_ISR);
   irq_set_enabled(irq_index ? DMA_IRQ_1 : DMA_IRQ_0, true);
 
   printf("irq configured\n");
 
-  uint32_t n = 0;
-  int32_t min_imbalance = INT32_MAX;
-  int32_t max_imbalance = INT32_MIN;
+  uint32_t num_transfers = 0;
   for (;;) {
     if (!dma_channel_is_busy(tx_channel) && !dma_channel_is_busy(rx_channel) &&
         !spi_is_busy(spi1)) {
-      int32_t imbalance = tx_vs_rx_count;
-      if (imbalance < min_imbalance) min_imbalance = imbalance;
-      if (imbalance > max_imbalance) max_imbalance = imbalance;
-      if (++n % (spi_frequency / 50) == 0) {
-        printf("iteration %ld, imbalance: %ld, min %ld max %ld\n", n, imbalance,
-               min_imbalance, max_imbalance);
+      // Even if we make SURE to wait for both interrupts to finish
+      // before starting the next transfer, we lose some.
+      uint32_t wait_time = 0;
+      while (!got_tx || !got_rx) {
+        if (++wait_time > 1'000'000) break;
       }
+      if (wait_time > 1'000'000) {
+        printf("at iteration %ld got_tx=%d got_rx=%d\n", num_transfers, got_tx, got_rx);
+      }
+      if (num_transfers % (spi_frequency/20) == 0) {
+        printf("iteration %ld\n", num_transfers);
+      }
+ 
       // start next cycle
+      ++num_transfers;
+      got_tx = 0;
+      got_rx = 0;
       dma_channel_set_read_addr(tx_channel, tx_read, false);
       dma_channel_set_write_addr(rx_channel, rx_write, false);
       dma_channel_set_trans_count(tx_channel, transfer_count, false);
       dma_channel_set_trans_count(rx_channel, transfer_count, false);
+      // putting barriers doesn't help
+      __asm("dmb");
+      __asm("isb");
+      gpio_put(debug_gpio_start, !gpio_get(debug_gpio_start));
       dma_start_channel_mask((1u << tx_channel) | (1u << rx_channel));
     }
   }
