@@ -128,9 +128,9 @@ int main() {
       // before starting the next transfer, we lose some.
       uint32_t wait_time = 0;
       while (!got_tx || !got_rx) {
-        if (++wait_time > 1'000'000) break;
+        if (++wait_time > 10'000'000) break;
       }
-      if (wait_time > 1'000'000) {
+      if (wait_time > 10'000'000) {
         printf("at iteration %ld got_tx=%d got_rx=%d\n", num_transfers, got_tx, got_rx);
       }
       if (num_transfers % (spi_frequency/20) == 0) {
