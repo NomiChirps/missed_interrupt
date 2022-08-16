@@ -30,16 +30,13 @@ const int debug_gpio_rx = 7;
 
 void DMA_ISR() {
   gpio_put(debug_gpio_irq, 1);
-  bool tx_irq = dma_irqn_get_channel_status(irq_index, tx_channel);
-  // bool rx_irq = dma_hw->intr & (1u << head->rx);
-  bool rx_irq = dma_irqn_get_channel_status(irq_index, rx_channel);
-  if (tx_irq) {
+  if (dma_irqn_get_channel_status(irq_index, tx_channel)) {
     gpio_put(debug_gpio_tx, !gpio_get(debug_gpio_tx));
     dma_irqn_acknowledge_channel(irq_index, tx_channel);
     tx_interrupt_count++;
     tx_vs_rx_count++;
   }
-  if (rx_irq) {
+  if (dma_irqn_get_channel_status(irq_index, rx_channel)) {
     gpio_put(debug_gpio_rx, !gpio_get(debug_gpio_rx));
     dma_irqn_acknowledge_channel(irq_index, rx_channel);
     rx_interrupt_count++;
