@@ -5,7 +5,7 @@
 #include "hardware/gpio.h"
 #include "hardware/irq.h"
 #include "hardware/spi.h"
-#include "pico/stdio_usb.h"
+#include "pico/stdio.h"
 #include "pico/time.h"
 
 int tx_channel;
@@ -13,6 +13,7 @@ int rx_channel;
 
 // At 100'000, imbalance is stable at zero.
 // At 1'000'000, it slowly grows.
+// At 2'000'000, grows more slowly...
 // At 8'000'000, stable.
 // At 16'000'000, stable.
 const int spi_frequency = 1'000'000;
@@ -48,7 +49,7 @@ void DMA_ISR() {
 }
 
 int main() {
-  stdio_usb_init();
+  stdio_init_all();
   printf("hello\n");
 
   gpio_init(debug_gpio_irq);
