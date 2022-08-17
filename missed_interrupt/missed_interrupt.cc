@@ -5,55 +5,91 @@
 #include "hardware/gpio.h"
 #include "hardware/irq.h"
 #include "hardware/spi.h"
-#include "pico/stdio.h"
 #include "pico/time.h"
+#include "pico/sync.h"
+#include "pico/stdio.h"
+
+#if LIB_PICO_STDIO_UART
+#error no
+#endif
+#if LIB_PICO_STDIO_USB
+#error no
+#endif
+#if LIB_PICO_STDIO_SEMIHOSTING
+#error no
+#endif
+
 
 int tx_channel;
 int rx_channel;
 
-const int spi_frequency = 8'000'000;
+const int spi_frequency = 4'000'000;
 
 const int irq_index = 1;
+
+const int debug_gpio_missed = 5;
+const int debug_gpio_tx = 6;
+const int debug_gpio_rx = 7;
+const int debug_gpio_start = 8;
+const int debug_gpio_irq = 9;
 
 volatile bool got_tx = 0;
 volatile bool got_rx = 0;
 
-const int debug_gpio_irq = 5;
-const int debug_gpio_tx = 6;
-const int debug_gpio_rx = 7;
-const int debug_gpio_start = 8;
 
-// Straightforward: checks one channel, acks it, then the other.
-void DMA_ISR() {
-  gpio_put(debug_gpio_irq, 1);
-  if (dma_irqn_get_channel_status(irq_index, tx_channel)) {
-    gpio_put(debug_gpio_tx, !gpio_get(debug_gpio_tx));
-    dma_irqn_acknowledge_channel(irq_index, tx_channel);
-    got_tx = 1;
-  }
-  if (dma_irqn_get_channel_status(irq_index, rx_channel)) {
+void __not_in_flash_func(DMA_ISR)() {
+  // 7: ok
+  // 9: not ok
+  //gpio_put(debug_gpio_irq, !gpio_get(debug_gpio_irq));
+  //gpio_put(debug_gpio_irq, !gpio_get(debug_gpio_irq));
+  busy_wait_us(10);
+  if (dma_hw->ints1 & (1<<rx_channel)) {
     gpio_put(debug_gpio_rx, !gpio_get(debug_gpio_rx));
-    dma_irqn_acknowledge_channel(irq_index, rx_channel);
+  }
+  if (dma_hw->ints1 & (1<<tx_channel)) {
+    gpio_put(debug_gpio_tx, !gpio_get(debug_gpio_tx));
+  }
+  gpio_put(debug_gpio_irq, dma_hw->ints1);
+  hw_set_bits(&dma_hw->ints1, 0);
+  gpio_put(debug_gpio_irq, dma_hw->ints1);
+  return;
+
+  if (dma_hw->ints1 & (1<<rx_channel)) {
+    gpio_put(debug_gpio_rx, !gpio_get(debug_gpio_rx));
+    // Direct assignment works correctly; hw_*_bits doesn't
+    //dma_irqn_acknowledge_channel(irq_index, rx_channel);
+    //hw_clear_bits(&dma_hw->ints1, 1u << rx_channel);
+    //dma_hw->ints1 = 1u << rx_channel;
+    hw_set_bits(&dma_hw->ints1, 0);
+    gpio_put(debug_gpio_irq, dma_hw->ints1);
     got_rx = 1;
   }
-  // putting barriers doesn't help
-  __asm("dmb");
-  __asm("isb");
-  gpio_put(debug_gpio_irq, 0);
+  if (dma_hw->ints1 & (1<<tx_channel)) {
+    gpio_put(debug_gpio_tx, !gpio_get(debug_gpio_tx));
+    // Direct assignment works correctly; hw_*_bits doesn't
+    //dma_irqn_acknowledge_channel(irq_index, tx_channel);
+    //hw_clear_bits(&dma_hw->ints1, 1u << tx_channel);
+    //dma_hw->ints1 = 1u<<tx_channel;
+    hw_set_bits(&dma_hw->ints1, 0);
+    gpio_put(debug_gpio_irq, dma_hw->ints1);
+    got_tx = 1;
+  }
+  //gpio_put(debug_gpio_irq, !gpio_get(debug_gpio_irq));
 }
 
 int main() {
-  stdio_init_all();
-  printf("hello\n");
+  busy_wait_ms(100);
 
-  gpio_init(debug_gpio_irq);
+  gpio_init(debug_gpio_missed);
   gpio_init(debug_gpio_tx);
   gpio_init(debug_gpio_rx);
   gpio_init(debug_gpio_start);
-  gpio_set_dir(debug_gpio_irq, GPIO_OUT);
+  gpio_init(debug_gpio_irq);
+  gpio_set_dir(debug_gpio_missed, GPIO_OUT);
   gpio_set_dir(debug_gpio_tx, GPIO_OUT);
   gpio_set_dir(debug_gpio_rx, GPIO_OUT);
   gpio_set_dir(debug_gpio_start, GPIO_OUT);
+  gpio_set_dir(debug_gpio_irq, GPIO_OUT);
 
   spi_init(spi1, spi_frequency);
   spi_set_format(spi1, 8, SPI_CPOL_0, SPI_CPHA_0, SPI_MSB_FIRST);
@@ -110,46 +146,35 @@ int main() {
   dma_channel_set_write_addr(rx_channel, rx_write, false);
   dma_channel_set_trans_count(rx_channel, transfer_count, false);
 
-  printf("channels configured\n");
-
   dma_irqn_set_channel_enabled(irq_index, tx_channel, true);
   dma_irqn_set_channel_enabled(irq_index, rx_channel, true);
 
   irq_set_exclusive_handler(irq_index ? DMA_IRQ_1 : DMA_IRQ_0, &DMA_ISR);
+  irq_set_priority(irq_index ? DMA_IRQ_1 : DMA_IRQ_0, 128);
   irq_set_enabled(irq_index ? DMA_IRQ_1 : DMA_IRQ_0, true);
-
-  printf("irq configured\n");
 
   uint32_t num_transfers = 0;
   for (;;) {
-    if (!dma_channel_is_busy(tx_channel) && !dma_channel_is_busy(rx_channel) &&
-        !spi_is_busy(spi1)) {
-      // Even if we make SURE to wait for both interrupts to finish
-      // before starting the next transfer, we lose some.
-      uint32_t wait_time = 0;
-      while (!got_tx || !got_rx) {
-        if (++wait_time > 10'000'000) break;
-      }
-      if (wait_time > 10'000'000) {
-        printf("at iteration %ld got_tx=%d got_rx=%d\n", num_transfers, got_tx, got_rx);
-      }
-      if (num_transfers % (spi_frequency/20) == 0) {
-        printf("iteration %ld\n", num_transfers);
-      }
- 
-      // start next cycle
-      ++num_transfers;
-      got_tx = 0;
-      got_rx = 0;
-      dma_channel_set_read_addr(tx_channel, tx_read, false);
-      dma_channel_set_write_addr(rx_channel, rx_write, false);
-      dma_channel_set_trans_count(tx_channel, transfer_count, false);
-      dma_channel_set_trans_count(rx_channel, transfer_count, false);
-      // putting barriers doesn't help
-      __asm("dmb");
-      __asm("isb");
-      gpio_put(debug_gpio_start, !gpio_get(debug_gpio_start));
-      dma_start_channel_mask((1u << tx_channel) | (1u << rx_channel));
+    // start next cycle
+    ++num_transfers;
+    got_tx = 0;
+    got_rx = 0;
+    dma_channel_set_read_addr(tx_channel, tx_read, false);
+    dma_channel_set_write_addr(rx_channel, rx_write, false);
+    dma_channel_set_trans_count(tx_channel, transfer_count, false);
+    dma_channel_set_trans_count(rx_channel, transfer_count, false);
+    gpio_put(debug_gpio_start, !gpio_get(debug_gpio_start));
+    dma_start_channel_mask((1u << tx_channel) | (1u << rx_channel));
+
+    // wait for it to finish
+    const uint32_t max_wait = 500;
+    uint32_t wait_time = 0;
+    //while (!got_tx || !got_rx || dma_irqn_get_channel_status(irq_index, tx_channel) || dma_irqn_get_channel_status(irq_index, rx_channel) || dma_hw->intr || dma_channel_is_busy(tx_channel) || dma_channel_is_busy(rx_channel) || spi_is_busy(spi1)) {
+    while (!got_tx || !got_rx || dma_irqn_get_channel_status(irq_index, tx_channel) || dma_irqn_get_channel_status(irq_index, rx_channel) || dma_channel_is_busy(tx_channel) || dma_channel_is_busy(rx_channel) || spi_is_busy(spi1)) {
+        if(wait_time++ > max_wait) break;
+    }
+    if (wait_time > max_wait) {
+        gpio_put(debug_gpio_missed, !gpio_get(debug_gpio_missed));
     }
   }
 
